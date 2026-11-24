@@ -1,0 +1,11 @@
+{
+  "name": "Smart Plant Care AI",
+  "short_name": "Plant Care",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#166534",
+  "background_color": "#f0fdf4",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

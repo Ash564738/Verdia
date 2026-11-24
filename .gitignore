@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+# Keep the trained checkpoint in deployment artifacts.
+models/*.labels.txt
+models/*.metadata.json
+models/*.evaluation.json
+frontend/node_modules/
+frontend/dist/
+.env
+.env.*
+!.env.example
