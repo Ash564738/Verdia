@@ -178,6 +178,7 @@ function DiagnosisPage() {
       if (!file) throw new Error("Chọn hoặc chụp một ảnh lá");
       const form = new FormData();
       form.append("file", file);
+      if (expectedSpecies) form.append("expected_species", expectedSpecies);
       if (note) form.append("note", note);
       const suffix = plantId ? `?plant_id=${encodeURIComponent(plantId)}` : "";
       return apiRequest<Diagnosis>(`/api/v1/diagnoses/predict${suffix}`, { method: "POST", body: form });
@@ -241,6 +242,7 @@ function DiagnosisResult({ result }: { result: Diagnosis }) {
     <h2>{result.disease?.name_vi || "Chưa xác định"}</h2>
     {result.plant?.name && <p className="result-plant">{result.plant.name_vi || result.plant.name}</p>}
     {result.prediction ? <>
+      {result.message && <div className="notice">{result.message}</div>}
       <div className="confidence"><div><span>Độ tin cậy</span><b>{Math.round(result.prediction.confidence * 100)}%</b></div><div className="confidence-track"><i style={{ width: `${Math.round(result.prediction.confidence * 100)}%` }} /></div></div>
       <div className="top-predictions"><p className="eyebrow">TOP 3 DỰ ĐOÁN</p>{result.prediction.top_predictions.map((item, index) => <div key={item.class}><span>{index + 1}. {item.class}</span><b>{Math.round(item.confidence * 100)}%</b></div>)}</div>
     </> : <div className="notice">{result.message || "Không thể đưa ra kết luận bệnh cho ảnh này."}</div>}

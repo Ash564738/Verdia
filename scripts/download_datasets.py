@@ -12,6 +12,29 @@ DATASETS = {
     "plantvillage": "https://github.com/spMohanty/PlantVillage-Dataset.git",
     "plantdoc": "https://github.com/pratikkayal/PlantDoc-Dataset.git",
 }
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _image_count(root: Path) -> int:
+    return sum(1 for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS) if root.exists() else 0
+
+
+def _already_complete(name: str, target: Path) -> bool:
+    if name == "plantvillage":
+        count = _image_count(target / "raw" / "color")
+        expected = 54305
+    else:
+        count = _image_count(target / "train") + _image_count(target / "test")
+        expected = 2579
+    if count >= expected:
+        print(f"{name}: {count} source images already present; leaving the working tree unchanged.")
+        return True
+    if count:
+        raise RuntimeError(
+            f"{name}: found {count}/{expected} images. Refusing to force-checkout over an existing "
+            "dataset directory; restore missing source files without overwriting the current data."
+        )
+    return False
 
 
 def _run_git(target: Path, *args: str, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
@@ -222,6 +245,11 @@ def main() -> None:
     root.mkdir(exist_ok=True)
     for name, url in DATASETS.items():
         target = root / name
+        try:
+            if _already_complete(name, target):
+                continue
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
         if target.exists() and (target / "README.md").exists():
             print(f"{name}: checking tracked files at {target}")
         print(f"Downloading {name}...")

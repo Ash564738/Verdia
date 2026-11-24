@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import logging
 import secrets
@@ -10,9 +11,11 @@ import unicodedata
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from app.config import APP_ENV, LOG_LEVEL, PROJECT_ROOT
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -22,20 +25,40 @@ from pydantic import BaseModel, Field
 from app.security import create_token, decode_token, hash_password, verify_password
 from app.services.diagnosis import DiagnosisService
 from app.services.qa import EnglishPlantQA
-from app.services.storage import delete_private_image, local_image_path, presigned_image_url, save_private_image
-from app.storage import connection, decode_json, init_db, row_dict
+from app.services.storage import (
+    STORAGE_BACKEND,
+    check_storage_ready,
+    delete_private_image,
+    local_image_path,
+    presigned_image_url,
+    save_private_image,
+    storage_configuration_errors,
+)
+from app.storage import DATABASE_URL, connection, decode_json, init_db, row_dict
 
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+# boto3/botocore DEBUG logs include signed Authorization headers and signatures.
+# Keep third-party transport logs quiet even when application LOG_LEVEL=DEBUG.
+for noisy_logger in ("botocore", "boto3", "urllib3"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger("smart-plant-care")
-log_dir = Path(__file__).parents[1] / "data" / "logs"
+log_dir = PROJECT_ROOT / "data" / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
-file_handler = logging.FileHandler(log_dir / "backend.log", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-logging.getLogger().addHandler(file_handler)
+log_format = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+root_logger = logging.getLogger()
+if not any(getattr(handler, "baseFilename", "").endswith("backend.log") for handler in root_logger.handlers):
+    file_handler = RotatingFileHandler(log_dir / "backend.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(log_format)
+    root_logger.addHandler(file_handler)
+diagnosis_logger = logging.getLogger("smart-plant-care.diagnosis")
+if not any(getattr(handler, "baseFilename", "").endswith("diagnosis.log") for handler in diagnosis_logger.handlers):
+    diagnosis_file_handler = RotatingFileHandler(log_dir / "diagnosis.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    diagnosis_file_handler.setFormatter(log_format)
+    diagnosis_logger.addHandler(diagnosis_file_handler)
 
 
 def now() -> str:
@@ -156,15 +179,33 @@ class ModelRequest(BaseModel):
 bearer = HTTPBearer(auto_error=False)
 diagnosis_service = DiagnosisService()
 qa_service = EnglishPlantQA()
-diagnosis_service.load()
 password_reset_tokens: dict[str, tuple[str, float]] = {}
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
+    logger.info("startup_started app_env=%s", APP_ENV)
+    configuration_errors = []
+    if APP_ENV != "test" and not DATABASE_URL:
+        configuration_errors.append("DATABASE_URL is missing; configure the PostgreSQL connection string from Supabase Dashboard > Connect")
+    elif APP_ENV != "test" and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        configuration_errors.append("DATABASE_URL must be PostgreSQL; the Supabase HTTPS project/API URL is not a database DSN")
+    configuration_errors.extend(storage_configuration_errors())
+    if configuration_errors:
+        logger.error("startup_configuration_invalid errors=%s", configuration_errors)
+        raise RuntimeError("Invalid backend configuration: " + " | ".join(configuration_errors))
+    check_storage_ready()
+    logger.info("startup_step_started step=database")
     init_db()
+    database_provider = "test_sqlite" if APP_ENV == "test" else "supabase_postgres"
+    logger.info("startup_step_succeeded step=database backend=%s", database_provider)
+    logger.info("startup_step_started step=model")
     diagnosis_service.load()
+    application.state.storage_ready = True
+    storage_provider = "disabled_test" if APP_ENV == "test" else "supabase_s3"
+    logger.info("startup_succeeded database=%s storage=%s model=%s", database_provider, storage_provider, diagnosis_service.model_status)
     yield
+    logger.info("shutdown_started")
 
 
 app = FastAPI(title="Smart Plant Care AI API", version="1.0.0", lifespan=lifespan)
@@ -177,17 +218,37 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.exception("unhandled_exception method=%s path=%s", request.method, request.url.path)
+    request_id = getattr(request.state, "request_id", "-")
+    logger.exception("unhandled_exception request_id=%s method=%s path=%s exception_type=%s", request_id, request.method, request.url.path, type(exc).__name__)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": "Internal server error", "request_id": request_id},
     )
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", "").strip()[:100] or getattr(request.state, "request_id", "") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    logger.info("http_request_started request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("http_request_failed request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    logger.info("http_request_completed request_id=%s method=%s path=%s status=%s duration_ms=%s", request_id, request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 rate_limits: dict[str, list[float]] = {}
 
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", "").strip()[:100] or getattr(request.state, "request_id", "") or str(uuid.uuid4())
+    request.state.request_id = request_id
     path = request.url.path
     protected = path.startswith("/api/v1/auth/login") or path.startswith("/api/v1/auth/register") or "diagnoses/predict" in path or path.endswith("/api/v1/diagnose")
     if protected:
@@ -197,7 +258,8 @@ async def rate_limit(request: Request, call_next):
         entries = [timestamp for timestamp in rate_limits.get(key, []) if now_time - timestamp < 60]
         limit = 10 if "/auth/" in path else 30
         if len(entries) >= limit:
-            raise HTTPException(429, "Too many requests. Please wait before retrying.")
+            logger.warning("http_request_rejected request_id=%s reason=rate_limit path=%s", request_id, path)
+            raise HTTPException(429, "Too many requests. Please wait before retrying.", headers={"X-Request-ID": request_id})
         entries.append(now_time)
         rate_limits[key] = entries
     return await call_next(request)
@@ -244,10 +306,32 @@ def audit(db: Any, actor_id: str, action: str, target_type: str, target_id: str 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    logger.info("health_check model=%s", diagnosis_service.model_status)
+    database_backend = "test_sqlite" if APP_ENV == "test" else "supabase_postgres"
+    storage_status = "disabled_test" if APP_ENV == "test" else "supabase_s3"
+    logger.info("health_check model=%s database=%s storage=%s", diagnosis_service.model_status, database_backend, storage_status)
     with connection() as db:
         db.execute("SELECT 1")
-    return {"status": "ok", "model": diagnosis_service.model_status, "database": "ok"}
+    return {"status": "ok", "model": diagnosis_service.model_status, "database": database_backend, "storage": storage_status}
+
+
+@app.get("/api/v1/model/info")
+def model_info() -> dict[str, Any]:
+    return diagnosis_service.info()
+
+
+@app.get("/api/v1/admin/diagnostics")
+def runtime_diagnostics(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with connection() as db:
+        db.execute("SELECT 1")
+    storage_errors = storage_configuration_errors()
+    report = {
+        "app_env": APP_ENV,
+        "database": {"provider": "test_sqlite" if APP_ENV == "test" else "supabase_postgres", "configured": bool(DATABASE_URL), "connected": True},
+        "storage": {"provider": "disabled_test" if APP_ENV == "test" else STORAGE_BACKEND, "configured": not storage_errors, "errors": storage_errors},
+        "model": diagnosis_service.info(),
+    }
+    logger.info("admin_runtime_diagnostics_created database_connected=true storage_configured=%s model_loaded=%s", not storage_errors, diagnosis_service._model is not None)
+    return report
 
 
 @app.post("/api/v1/auth/register", status_code=201)
@@ -384,17 +468,28 @@ def delete_plant(plant_id: str, user: dict[str, Any] = Depends(current_user)) ->
 
 
 @app.post("/api/v1/my-plants/{plant_id}/image")
-async def upload_plant_image(plant_id: str, file: UploadFile = File(...), user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+async def upload_plant_image(request: Request, plant_id: str, file: UploadFile = File(...), user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+    request_id = request.state.request_id
+    logger.info("plant_image_upload_received request_id=%s user_id=%s content_type=%s", request_id, user["id"], file.content_type)
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        logger.warning("plant_image_upload_rejected request_id=%s reason=unsupported_content_type content_type=%s", request_id, file.content_type)
         raise HTTPException(415, "Only JPEG, PNG, and WebP images are supported")
     payload = await file.read()
     if len(payload) > 10 * 1024 * 1024:
+        logger.warning("plant_image_upload_rejected request_id=%s reason=file_too_large bytes=%s", request_id, len(payload))
         raise HTTPException(413, "Image must be smaller than 10 MB")
-    validate_image(payload)
-    key = save_private_image(payload, file.filename, user["id"], f"plants/{plant_id}")
+    validate_image(payload, request_id)
     with connection() as db:
         owned(db, "plants", plant_id, user["id"])
-        db.execute("UPDATE plants SET image_path=? WHERE id=?", (key, plant_id))
+    key = save_private_image(payload, file.filename, user["id"], f"plants/{plant_id}", request_id)
+    try:
+        with connection() as db:
+            db.execute("UPDATE plants SET image_path=? WHERE id=?", (key, plant_id))
+    except Exception:
+        logger.exception("plant_image_database_save_failed request_id=%s user_id=%s plant_id=%s", request_id, user["id"], plant_id)
+        delete_private_image(key, request_id=request_id)
+        raise
+    logger.info("plant_image_upload_completed request_id=%s user_id=%s plant_id=%s sha256=%s bytes=%s", request_id, user["id"], plant_id, hashlib.sha256(payload).hexdigest(), len(payload))
     return {"storage_key": key}
 
 
@@ -414,102 +509,115 @@ def plant_image(plant_id: str, user: dict[str, Any] = Depends(current_user)) -> 
     raise HTTPException(404, "Private image storage is unavailable")
 
 
-def validate_image(payload: bytes) -> Image.Image:
+def validate_image(payload: bytes, request_id: str = "-") -> Image.Image:
+    logger.info("image_validation_started request_id=%s bytes=%s sha256=%s", request_id, len(payload), hashlib.sha256(payload).hexdigest())
     try:
         image = Image.open(io.BytesIO(payload))
+        source_mode = image.mode
         image.verify()
         image = Image.open(io.BytesIO(payload)).convert("RGB")
     except (UnidentifiedImageError, OSError) as exc:
+        logger.exception("image_validation_failed request_id=%s reason=decode_error", request_id)
         raise HTTPException(400, "The uploaded file is not a valid image") from exc
     if image.width < 32 or image.height < 32:
+        logger.warning("image_validation_failed request_id=%s reason=dimensions width=%s height=%s", request_id, image.width, image.height)
         raise HTTPException(400, "Image dimensions must be at least 32x32 pixels")
     stats = ImageStat.Stat(image)
     if max(stats.mean) < 15:
+        logger.warning("image_validation_failed request_id=%s reason=too_dark channel_means=%s", request_id, [round(value, 2) for value in stats.mean])
         raise HTTPException(422, "Image is too dark; please take another photo")
     if max(stats.var) < 80:
+        logger.warning("image_validation_failed request_id=%s reason=low_variance channel_variances=%s", request_id, [round(value, 2) for value in stats.var])
         raise HTTPException(422, "Image appears too blurry or uniform; please take another photo")
     pixels = image.resize((64, 64)).getdata()
     green_pixels = sum(1 for r, g, b in pixels if g > r * 1.05 and g > b * 1.05)
     if green_pixels / 4096 < 0.05:
+        logger.warning("image_validation_failed request_id=%s reason=low_green_ratio ratio=%.4f", request_id, green_pixels / 4096)
         raise HTTPException(422, "Leaf area is too small or image does not appear to show a plant leaf")
+    logger.info("image_validation_succeeded request_id=%s width=%s height=%s source_mode=%s normalized_mode=RGB mean=%s variance=%s green_ratio=%.4f", request_id, image.width, image.height, source_mode, [round(value, 2) for value in stats.mean], [round(value, 2) for value in stats.var], green_pixels / 4096)
     return image
 
 
 
 
 @app.post("/api/v1/diagnose")
-async def diagnose(file: UploadFile = File(...), user: dict[str, Any] | None = Depends(lambda: None)) -> dict[str, Any]:
+async def diagnose(request: Request, file: UploadFile = File(...), user: dict[str, Any] | None = Depends(lambda: None)) -> dict[str, Any]:
+    request_id = request.state.request_id
+    logger.info("diagnosis_request_received request_id=%s mode=stateless content_type=%s", request_id, file.content_type)
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(415, "Only JPEG, PNG, and WebP images are supported")
     payload = await file.read()
     if len(payload) > 10 * 1024 * 1024:
         raise HTTPException(413, "Image must be smaller than 10 MB")
-    image = validate_image(payload)
+    image = validate_image(payload, request_id)
     try:
         diagnosis_service.require_model()
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
-    result = diagnosis_service.predict(image)
+    result = diagnosis_service.predict(image, request_id=request_id)
     return {"filename": file.filename, **result}
 
 
 @app.post("/api/v1/diagnoses/predict")
-async def predict(file: UploadFile = File(...), plant_id: str | None = None, note: str | None = None, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+async def predict(request: Request, file: UploadFile = File(...), plant_id: str | None = None, expected_species: str | None = Form(None), note: str | None = Form(None), user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    request_id = request.state.request_id
+    logger.info("diagnosis_request_received request_id=%s user_id=%s plant_id=%s content_type=%s", request_id, user["id"], plant_id or "none", file.content_type)
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        logger.warning("diagnosis_request_rejected request_id=%s reason=unsupported_content_type content_type=%s", request_id, file.content_type)
         raise HTTPException(415, "Only JPEG, PNG, and WebP images are supported")
     payload = await file.read()
     if len(payload) > 10 * 1024 * 1024:
+        logger.warning("diagnosis_request_rejected request_id=%s reason=file_too_large bytes=%s", request_id, len(payload))
         raise HTTPException(413, "Image must be smaller than 10 MB")
-    image = validate_image(payload)
+    image = validate_image(payload, request_id)
+    if expected_species and expected_species not in {item["id"] for item in plants_catalog()}:
+        raise HTTPException(422, "Selected crop is not in the supported crop catalog")
+    if plant_id:
+        with connection() as db:
+            plant_record = owned(db, "plants", plant_id, user["id"])
+        if expected_species and expected_species.lower() != plant_record["species"].lower():
+            raise HTTPException(422, "Selected crop conflicts with the species of the linked plant")
+        expected_species = plant_record["species"]
     try:
         diagnosis_service.require_model()
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
-    result = diagnosis_service.predict(image)
-    saved_image = save_private_image(payload, file.filename, user["id"], "diagnoses")
+    logger.info("diagnosis_inference_started request_id=%s user_id=%s sha256=%s bytes=%s", request_id, user["id"], hashlib.sha256(payload).hexdigest(), len(payload))
+    logger.info("diagnosis_crop_context request_id=%s selected_species=%s linked_plant_id=%s", request_id, expected_species or "automatic", plant_id or "none")
+    result = diagnosis_service.predict(image, request_id=request_id, expected_species=expected_species)
+    logger.info("diagnosis_inference_finished request_id=%s model=%s status=%s confidence=%.6f diagnosis=%s top_k=%s", request_id, result.get("model", {}).get("name"), result.get("status"), result.get("confidence", 0.0), result.get("diagnosis"), result.get("prediction", {}).get("top_predictions", []))
+    saved_image = save_private_image(payload, file.filename, user["id"], "diagnoses", request_id)
     diagnosis_id = str(uuid.uuid4())
-    with connection() as db:
-        if plant_id:
-            owned(db, "plants", plant_id, user["id"])
-        prediction = result.get("prediction") or {}
-        top_predictions = prediction.get("top_predictions", [])
-        db.execute(
-            "INSERT INTO diagnoses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                diagnosis_id,
-                user["id"],
-                plant_id,
-                file.filename,
-                saved_image,
-                result["plant"]["name"],
-                result["disease"]["code"],
-                result["status"],
-                float(prediction.get("confidence", result["confidence"])),
-                __import__("json").dumps(top_predictions),
-                result["recommendation"],
-                result["model"]["version"],
-                result["severity"],
-                note,
-                now(),
-            ),
-        )
-        db.execute(
-            "INSERT INTO diagnosis_images (id,diagnosis_id,user_id,storage_key,filename,created_at) VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), diagnosis_id, user["id"], saved_image, file.filename, now()),
-        )
-        for rank, item in enumerate(top_predictions, start=1):
+    try:
+        with connection() as db:
+            if plant_id:
+                owned(db, "plants", plant_id, user["id"])
+            prediction = result.get("prediction") or {}
+            top_predictions = prediction.get("top_predictions", [])
             db.execute(
-                "INSERT INTO scan_predictions (id,diagnosis_id,class_code,class_name,confidence,rank,created_at) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO diagnoses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    str(uuid.uuid4()),
-                    diagnosis_id,
-                    item["class"],
-                    item["class"],
-                    float(item["confidence"]),
-                    rank,
-                    now(),
+                    diagnosis_id, user["id"], plant_id, file.filename, saved_image,
+                    result["plant"]["name"], result["disease"]["code"], result["status"],
+                    float(prediction.get("confidence", result["confidence"])),
+                    __import__("json").dumps(top_predictions), result["recommendation"],
+                    result["model"]["version"], result["severity"], note, now(),
                 ),
             )
+            db.execute(
+                "INSERT INTO diagnosis_images (id,diagnosis_id,user_id,storage_key,filename,created_at) VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), diagnosis_id, user["id"], saved_image, file.filename, now()),
+            )
+            for rank, item in enumerate(top_predictions, start=1):
+                db.execute(
+                    "INSERT INTO scan_predictions (id,diagnosis_id,class_code,class_name,confidence,rank,created_at) VALUES (?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), diagnosis_id, item["class"], item["class"], float(item["confidence"]), rank, now()),
+                )
+    except Exception:
+        logger.exception("diagnosis_database_save_failed request_id=%s diagnosis_id=%s user_id=%s", request_id, diagnosis_id, user["id"])
+        delete_private_image(saved_image, request_id=request_id)
+        raise
+    logger.info("diagnosis_request_completed request_id=%s diagnosis_id=%s user_id=%s storage=supabase_s3 database=supabase_postgres", request_id, diagnosis_id, user["id"])
     return {"id": diagnosis_id, **result, "created_at": now()}
 
 

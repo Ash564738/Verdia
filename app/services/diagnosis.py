@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
 import logging
+import time
 
 from PIL import Image
 
@@ -26,12 +29,12 @@ class DiagnosisService:
         self._labels = ["healthy", "apple_scab", "tomato_early_blight", "potato_late_blight"]
 
     def load(self) -> None:
-        logger.info("loading_diagnosis_model")
         checkpoint = Path(__file__).parents[2] / "models" / "plant_health.pt"
         state_checkpoint = checkpoint.with_suffix(".pth")
         labels_file = checkpoint.with_suffix(".labels.txt")
         metadata_file = checkpoint.with_suffix(".metadata.json")
         metadata: dict[str, Any] = {}
+        logger.info("model_load_started torchscript_exists=%s state_dict_exists=%s labels_exists=%s metadata_exists=%s", checkpoint.exists(), state_checkpoint.exists(), labels_file.exists(), metadata_file.exists())
         if labels_file.exists():
             self._labels = [line.strip() for line in labels_file.read_text().splitlines() if line.strip()]
         if metadata_file.exists():
@@ -39,11 +42,12 @@ class DiagnosisService:
             metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
         threshold_file = checkpoint.with_suffix(".threshold.json")
         if threshold_file.exists():
-            import json
             threshold_config = json.loads(threshold_file.read_text(encoding="utf-8"))
             candidate_threshold = float(threshold_config.get("confidence_threshold", self._confidence_threshold))
             if 0.0 <= candidate_threshold <= 1.0:
                 self._confidence_threshold = candidate_threshold
+            else:
+                logger.warning("model_threshold_invalid value=%s; using default=0.6", candidate_threshold)
         if not checkpoint.exists() and not state_checkpoint.exists():
             logger.warning("diagnosis_checkpoint_missing path=%s", checkpoint)
             return
@@ -87,22 +91,99 @@ class DiagnosisService:
                 ]
             )
             self._model_version = str(metadata.get("version", "1.0.0"))
-        except (ImportError, RuntimeError, OSError) as exc:
+            actual_path = state_checkpoint if state_checkpoint.exists() else checkpoint
+            fingerprint = hashlib.sha256(actual_path.read_bytes()).hexdigest()
+            logger.info("model_load_succeeded source=%s architecture=%s version=%s class_count=%s image_size=%s threshold=%.6f checkpoint_bytes=%s checkpoint_sha256=%s", "pytorch_state_dict" if state_checkpoint.exists() else "torchscript", metadata.get("architecture", "unknown"), self._model_version, len(self._labels), self._input_size, self._confidence_threshold, actual_path.stat().st_size, fingerprint)
+        except Exception as exc:
             self.model_status = f"checkpoint_unavailable:{type(exc).__name__}"
-            logger.exception("diagnosis_checkpoint_load_failed error=%s", exc)
+            self._model = None
+            self._transform = None
+            logger.exception("model_load_failed exception_type=%s", type(exc).__name__)
 
-    def predict(self, image: Image.Image) -> dict[str, Any]:
-        logger.info("diagnosis_predict_started width=%s height=%s", image.width, image.height)
+    def info(self) -> dict[str, Any]:
+        """Non-secret model and runtime diagnostics for the model info endpoint."""
+        root = Path(__file__).parents[2]
+        checkpoint = root / "models" / "plant_health.pt"
+        state_checkpoint = checkpoint.with_suffix(".pth")
+        metadata_path = checkpoint.with_suffix(".metadata.json")
+        training_path = checkpoint.with_suffix(".training.json")
+        evaluation_path = checkpoint.with_suffix(".evaluation.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        training = json.loads(training_path.read_text(encoding="utf-8")) if training_path.exists() else {}
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8")) if evaluation_path.exists() else {}
+        active_path = state_checkpoint if self._model is not None and state_checkpoint.exists() else checkpoint
+        import torch
+
+        return {
+            "status": self.model_status,
+            "loaded": self._model is not None and self._transform is not None,
+            "architecture": metadata.get("architecture"),
+            "version": getattr(self, "_model_version", "1.0.0"),
+            "class_count": len(self._labels),
+            "classes": self._labels,
+            "image_size": self._input_size,
+            "confidence_threshold": self._confidence_threshold,
+            "checkpoint": active_path.name if active_path.exists() else None,
+            "checkpoint_bytes": active_path.stat().st_size if active_path.exists() else None,
+            "checkpoint_sha256": hashlib.sha256(active_path.read_bytes()).hexdigest() if active_path.exists() else None,
+            "torch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "training_complete": training.get("complete"),
+            "completed_epochs": training.get("completed_epochs"),
+            "requested_epochs": training.get("requested_epochs"),
+            "plantvillage_test_accuracy": evaluation.get("accuracy"),
+            "plantvillage_test_macro_f1": evaluation.get("macro_f1"),
+        }
+
+    @staticmethod
+    def _normalize_crop(value: str) -> str:
+        crop = value.strip().lower().replace("_", " ")
+        return {
+            "pepper, bell": "bell pepper", "bell pepper": "bell pepper",
+            "corn (maize)": "corn", "maize": "corn",
+            "cherry (including sour)": "cherry",
+        }.get(crop, crop)
+
+    def predict(self, image: Image.Image, request_id: str = "-", expected_species: str | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
+        original_mode = image.mode
+        logger.info("diagnosis_inference_started request_id=%s width=%s height=%s source_mode=%s model_status=%s threshold=%.6f", request_id, image.width, image.height, original_mode, self.model_status, self._confidence_threshold)
         if image.width < 32 or image.height < 32:
+            logger.warning("diagnosis_inference_rejected request_id=%s reason=dimensions width=%s height=%s", request_id, image.width, image.height)
             raise ValueError("Image dimensions must be at least 32x32 pixels")
 
         if self._model is not None and self._transform is not None:
             import torch
 
-            with torch.inference_mode():
-                probabilities = torch.softmax(self._model(self._transform(image).unsqueeze(0)), dim=1)[0]
-            top_values, top_indices = torch.topk(probabilities, k=min(3, len(probabilities)))
-            index = int(top_indices[0])
+            try:
+                rgb_image = image.convert("RGB")
+                tensor = self._transform(rgb_image).unsqueeze(0)
+                with torch.inference_mode():
+                    logits = self._model(tensor)
+                    probabilities = torch.softmax(logits, dim=1)[0]
+                if not torch.isfinite(probabilities).all():
+                    raise RuntimeError("Model output contains NaN or infinite probabilities")
+            except Exception:
+                logger.exception("diagnosis_inference_failed request_id=%s stage=forward", request_id)
+                raise
+            global_index = int(probabilities.argmax())
+            global_label = self._labels[global_index]
+            global_plant, _ = self._split_label(global_label)
+            expected_crop = self._normalize_crop(expected_species) if expected_species else None
+            crop_mismatch = False
+            if expected_crop:
+                crop_indices = [i for i, candidate in enumerate(self._labels)
+                                if self._normalize_crop(self._split_label(candidate)[0]) == expected_crop]
+                if not crop_indices:
+                    raise ValueError(f"No model classes are available for selected crop: {expected_species}")
+                crop_mismatch = self._normalize_crop(global_plant) != expected_crop
+                ranked = sorted(crop_indices, key=lambda i: float(probabilities[i]), reverse=True)[:3]
+                top_indices = torch.tensor(ranked, dtype=torch.long)
+                top_values = probabilities[top_indices]
+                index = ranked[0]
+            else:
+                top_values, top_indices = torch.topk(probabilities, k=min(3, len(probabilities)))
+                index = int(top_indices[0])
             label = self._labels[index] if index < len(self._labels) else f"class_{index}"
             confidence = float(probabilities[index])
             recommendation = "Follow the crop-specific treatment guidance and consult an agronomist for severe symptoms."
@@ -110,6 +191,7 @@ class DiagnosisService:
             label = "healthy"
             confidence = 0.5
             recommendation = "No trained checkpoint is loaded. Run scripts/train.py before using this result."
+            top_values, top_indices = [], []
         record = {"label": label, "confidence": confidence}
         self._predictions.append(record)
         plant_name, disease_name = self._split_label(label)
@@ -178,8 +260,12 @@ class DiagnosisService:
             "bell pepper": "bell pepper",
             "corn (maize)": "corn",
         }.get(normalized_plant, normalized_plant)
-        if normalized_plant not in {crop.lower() for crop in supported_crops}:
+        if expected_species and self._normalize_crop(expected_species) not in {crop.lower() for crop in supported_crops}:
             status = "unsupported_crop"
+        elif normalized_plant not in {crop.lower() for crop in supported_crops}:
+            status = "unsupported_crop"
+        elif expected_species and crop_mismatch:
+            status = "uncertain"
         elif confidence < self._confidence_threshold:
             status = "uncertain"
         elif label == "healthy" or label.endswith("_healthy") or "healthy" in disease_name.lower():
@@ -197,29 +283,34 @@ class DiagnosisService:
             ]
         else:
             top_predictions = [{"class": label, "confidence": round(confidence, 4)}]
-        explainability = self.explain(image, index) if self._model is not None else {
+        explainability = self.explain(image, index) if self._model is not None and not crop_mismatch else {
             "available": False,
-            "message": "A trained checkpoint is required for explainability.",
+            "message": "A model disagreement makes a crop-specific heatmap misleading." if self._model is not None else "A trained checkpoint is required for explainability.",
         }
         prediction = {
             "status": status,
             "confidence": round(confidence, 4),
             "top_predictions": top_predictions,
         } if status != "unsupported_crop" else None
+        uncertain = status in {"uncertain", "unknown_disease"}
+        display_plant = expected_species if expected_species and status != "unsupported_crop" else plant_name
         response = {
-            "diagnosis": label,
+            "diagnosis": "uncertain" if uncertain else label,
             "confidence": confidence,
             "model": {"name": self.model_status, "version": getattr(self, "_model_version", "1.0.0")},
-            "recommendation": matched["treatment"] if status != "uncertain" else "Tăng chụp ảnh lá rõ, đủ sáng và thử chụp lại. Không đưa ra kết luận với độ tin cậy thấp.",
-            "plant": {"name": plant_name, "name_vi": plant_name},
+            "recommendation": ("Retake a sharp, well-lit leaf photo. The model disagrees with the selected crop, so no disease conclusion is provided." if crop_mismatch else "Retake a sharp, well-lit leaf photo. Confidence is too low for a disease conclusion.") if uncertain else matched["treatment"],
+            "plant": {"name": display_plant, "name_vi": display_plant},
             "disease": {
-                "code": disease_code,
-                "name": disease_name,
-                "name_vi": matched["name_vi"],
+                "code": "uncertain" if uncertain else disease_code,
+                "name": "Uncertain" if uncertain else disease_name,
+                "name_vi": "Chưa xác định" if uncertain else matched["name_vi"],
             },
-            "symptoms": matched["symptoms"],
-            "cause": matched["cause"],
-            "prevention": matched["prevention"],
+            "symptoms": "Cannot confirm disease symptoms from this image." if uncertain else matched["symptoms"],
+            "cause": "Unknown; retake a clearer image or consult a plant specialist." if uncertain else matched["cause"],
+            "prevention": "Monitor the plant and retake a clear leaf photo; do not apply disease-specific treatment yet." if uncertain else matched["prevention"],
+            "expected_species": expected_species,
+            "model_top_species": global_plant if self._model is not None else None,
+            "species_mismatch": crop_mismatch if self._model is not None else False,
             "health_assessment": {
                 "status": "healthy" if status == "healthy" else "disease_detected" if status == "diagnosed" else "needs_review",
                 "risk": "none" if status == "healthy" else "unassessed",
@@ -234,13 +325,12 @@ class DiagnosisService:
         if status == "unsupported_crop":
             response["message"] = "Loại cây này chưa nằm trong phạm vi hỗ trợ của mô hình."
         elif status == "uncertain":
-            response["message"] = "Mô hình chưa đủ tin cậy để đưa ra kết luận."
-        logger.info(
-            "diagnosis_predict_completed status=%s confidence=%.4f plant=%s",
-            status,
-            confidence,
-            plant_name,
-        )
+            response["message"] = (
+                f"Bạn chọn {expected_species}, nhưng mô hình đang nghiêng về {global_plant}. "
+                "Kết quả dưới đây chỉ là các lớp trong loài đã chọn; hãy kiểm tra lại loài và chụp ảnh lá rõ hơn."
+                if crop_mismatch else "Mô hình chưa đủ tin cậy để đưa ra kết luận."
+            )
+        logger.info("diagnosis_predict_completed request_id=%s expected_species=%s model_top_species=%s species_mismatch=%s status=%s label=%s plant=%s disease=%s confidence=%.6f threshold=%.6f top_k=%s duration_ms=%.2f", request_id, expected_species or "none", global_plant if self._model is not None else "none", crop_mismatch if self._model is not None else False, status, label, display_plant, disease_name, confidence, self._confidence_threshold, top_predictions, (time.perf_counter() - started) * 1000)
         return response
 
     def require_model(self) -> None:

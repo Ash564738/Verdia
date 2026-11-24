@@ -1,0 +1,7 @@
+{
+  "confidence_threshold": 0.4736181765794754,
+  "method": "5th percentile of PlantVillage validation max-softmax confidence",
+  "target_in_domain_rejection_rate": 0.05,
+  "calibration_dataset": "PlantVillage validation",
+  "ood_test_used_for_calibration": false
+}

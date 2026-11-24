@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import logging
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlsplit
+
+from app.config import APP_ENV
 
 logger = logging.getLogger("smart-plant-care.storage")
 
 
 DB_PATH = Path(os.getenv("DATABASE_PATH", Path(__file__).parents[1] / "data" / "smart_plant_care.db"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
 class PostgresWrapper:
@@ -52,6 +55,9 @@ class PostgresWrapper:
     def commit(self) -> None:
         self.connection.commit()
 
+    def rollback(self) -> None:
+        self.connection.rollback()
+
     def close(self) -> None:
         self.connection.close()
 
@@ -80,35 +86,64 @@ class PostgresCursor:
 
 
 @contextmanager
-def connection() -> Iterator[sqlite3.Connection]:
+def connection() -> Iterator[Any]:
+    started = time.perf_counter()
     if DATABASE_URL:
+        if not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+            raise RuntimeError("DATABASE_URL must be the PostgreSQL connection string from Supabase Dashboard > Connect")
+        db_host = urlsplit(DATABASE_URL).hostname or "unknown"
+        logger.info("postgres_connection_started provider=supabase host=%s", db_host)
         try:
             import psycopg
-            raw = psycopg.connect(DATABASE_URL)
+            raw = psycopg.connect(DATABASE_URL, connect_timeout=10, sslmode="require")
             db: Any = PostgresWrapper(raw)
-            logger.info("postgres_connection_opened")
+            logger.debug("postgres_connection_opened provider=supabase")
         except Exception as exc:
-            logger.exception("postgres_connection_failed")
-            raise RuntimeError("PostgreSQL is unavailable") from exc
-    else:
+            message = str(exc).lower()
+            if "getaddrinfo failed" in message or "name or service not known" in message or "temporary failure in name resolution" in message:
+                logger.exception("postgres_connection_failed provider=supabase cause=dns_resolution host=%s", db_host)
+                raise RuntimeError(
+                    "Supabase database hostname cannot be resolved from this network. In Supabase Dashboard > Connect, "
+                    "copy the Session pooler connection string (or Transaction pooler if that is the available IPv4 option), "
+                    "then set DATABASE_URL to that exact URI and restart. Direct db.<project>.supabase.co may be IPv6-only."
+                ) from exc
+            logger.exception("postgres_connection_failed provider=supabase host=%s", db_host)
+            raise RuntimeError("Supabase PostgreSQL connection failed; verify the Dashboard > Connect URI, password, network, and SSL") from exc
+    elif APP_ENV == "test":
+        import sqlite3
+
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(DB_PATH)
         db.row_factory = sqlite3.Row
+    else:
+        raise RuntimeError("DATABASE_URL is required; local SQLite is disabled for application data")
     try:
         yield db
         db.commit()
+        logger.debug("database_transaction_committed backend=%s duration_ms=%.2f", "supabase_postgres" if DATABASE_URL else "test_sqlite", (time.perf_counter() - started) * 1000)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("database_rollback_failed backend=%s", "supabase_postgres" if DATABASE_URL else "test_sqlite")
+        logger.exception("database_transaction_failed backend=%s duration_ms=%.2f", "supabase_postgres" if DATABASE_URL else "test_sqlite", (time.perf_counter() - started) * 1000)
+        raise
     finally:
         db.close()
 
 
 def init_db() -> None:
-    logger.info("initializing_database backend=%s", "postgres" if DATABASE_URL else "sqlite")
+    if not DATABASE_URL and APP_ENV != "test":
+        raise RuntimeError("DATABASE_URL is required; copy the PostgreSQL connection string from Supabase Dashboard > Connect")
+    if DATABASE_URL and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        raise RuntimeError("DATABASE_URL is an HTTPS API URL; use the PostgreSQL connection string from Supabase Dashboard > Connect")
+    logger.info("database_initialization_started backend=%s", "supabase_postgres" if DATABASE_URL else "test_sqlite")
     with connection() as db:
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-                name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'USER', is_active INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'USER', is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS plants (
@@ -133,7 +168,7 @@ def init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS reminders (
                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL, plant_id TEXT, kind TEXT NOT NULL,
-                due_at TEXT NOT NULL, note TEXT, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+                due_at TEXT NOT NULL, note TEXT, completed BOOLEAN NOT NULL DEFAULT FALSE, created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS feedback (
                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL, diagnosis_id TEXT NOT NULL,
@@ -159,7 +194,7 @@ def init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS notifications (
                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL,
-                message TEXT NOT NULL, kind TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL, kind TEXT NOT NULL, is_read BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -169,7 +204,7 @@ def init_db() -> None:
             INSERT OR IGNORE INTO roles (id,name) VALUES ('role-user','USER'),('role-admin','ADMIN');
             """
         )
-        if not DATABASE_URL:
+        if APP_ENV == "test":
             existing = {row["name"] for row in db.execute("PRAGMA table_info(model_versions)")}
             model_columns = {
                 "architecture": "TEXT",
@@ -200,6 +235,7 @@ def init_db() -> None:
                 VALUES (?,?,?,?,?,?,?)""",
                 ("admin", admin_email.lower(), hash_password(admin_password), "Administrator", "ADMIN", True, now_iso()),
             )
+    logger.info("database_initialization_succeeded backend=%s", "supabase_postgres" if DATABASE_URL else "test_sqlite")
 
 
 def now_iso() -> str:

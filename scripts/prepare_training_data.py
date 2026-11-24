@@ -15,7 +15,8 @@ from collections import defaultdict
 from pathlib import Path
 
 
-SPLIT_URL = "https://huggingface.co/datasets/mohanty/PlantVillage/resolve/main/splits/color_{split}.txt"
+SPLIT_REVISION = "9e97599868962bd0079b8db4b7f1efa9185fa1e7"
+SPLIT_URL = f"https://huggingface.co/datasets/mohanty/PlantVillage/resolve/{SPLIT_REVISION}/splits/color_{{split}}.txt"
 
 
 def read_official_split(root: Path, split: str) -> list[Path]:

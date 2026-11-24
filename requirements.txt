@@ -9,3 +9,4 @@ torchvision==0.21.0
 numpy==2.5.5
 psycopg[binary]==3.2.12
 boto3==1.35.99
+python-dotenv==1.2.3

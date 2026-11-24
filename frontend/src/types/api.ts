@@ -23,6 +23,9 @@ export type Diagnosis = {
   id: string;
   status: string;
   message?: string;
+  expected_species?: string | null;
+  model_top_species?: string | null;
+  species_mismatch?: boolean;
   confidence: number;
   model: { name: string; version: string };
   plant: { name: string; name_vi: string };
